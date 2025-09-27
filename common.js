@@ -23,6 +23,10 @@ const kFileData             = 1;
 const kProtoHttp            = 0;
 const kProtoWebsocket       = 1;
 
+// Media tracks.
+const kTrackVideo           = 0;
+const kTrackAudio           = 1;
+
 //Decoder request.
 const kInitDecoderReq       = 0;
 const kUninitDecoderReq     = 1;
@@ -76,5 +80,13 @@ Logger.prototype.currentTimeStr = function () {
     var sec = now.getSeconds();
     var ms = now.getMilliseconds();
     return year + "-" + month + "-" + day + " " + hour + ":" + min + ":" + sec + ":" + ms;
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        Logger: Logger,
+        kTrackVideo: kTrackVideo,
+        kTrackAudio: kTrackAudio,
+    };
 }
 

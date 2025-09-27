@@ -1,0 +1,17 @@
+{
+  "name": "wasmvideoplayer",
+  "version": "1.0.0",
+  "description": "WebAssembly based H265 web video player.",
+  "main": "common.js",
+  "scripts": {
+    "build:decoder": "bash ./build_decoder_wasm.sh",
+    "test": "npm run build:decoder && jest"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "jest": "^30.1.3"
+  }
+}

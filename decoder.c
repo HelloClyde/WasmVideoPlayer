@@ -2,10 +2,12 @@
 #include <sys/time.h>
 #include <sys/timeb.h>
 #include <unistd.h>
+#include <float.h>
+#include <errno.h>
 
 typedef void(*VideoCallback)(unsigned char *buff, int size, double timestamp);
 typedef void(*AudioCallback)(unsigned char *buff, int size, double timestamp);
-typedef void(*RequestCallback)(int offset, int available);
+typedef void(*RequestCallback)(int track, int offset, int available);
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +24,7 @@ const int kCustomIoBufferSize = 32 * 1024;
 const int kInitialPcmBufferSize = 128 * 1024;
 const int kDefaultFifoSize = 1 * 1024 * 1024;
 const int kMaxFifoSize = 16 * 1024 * 1024;
+const int kSeparateStreamDisabled = -2;
 
 typedef enum ErrorCode {
     kErrorCode_Success = 0,
@@ -42,22 +45,47 @@ typedef enum LogLevel {
     kLogLevel_All   //Logging all, with ffmpeg.
 } LogLevel;
 
+#define TRACK_TYPE_VIDEO 0
+#define TRACK_TYPE_AUDIO 1
+
+typedef struct DecoderStream {
+    enum AVMediaType type;
+    AVFormatContext *formatContext;
+    AVCodecContext *codecContext;
+    AVIOContext *ioContext;
+    int streamIdx;
+    AVRational timeBase;
+    unsigned char *frameBuffer;
+    int bufferCapacity;
+    int frameSize;
+    unsigned char *customIoBuffer;
+
+    FILE *fp;
+    char fileName[64];
+    int64_t fileSize;
+    int64_t fileReadPos;
+    int64_t fileWritePos;
+    int64_t lastRequestOffset;
+    int isStream;
+    AVFifoBuffer *fifo;
+    int fifoSize;
+
+    int trackType;
+    int opened;
+    int reachedEof;
+    double lastPts;
+    int hasDecodedFrame;
+} DecoderStream;
+
 typedef struct WebDecoder {
     AVFormatContext *avformatContext;
-    AVCodecContext *videoCodecContext;
-    AVCodecContext *audioCodecContext;
+    int multiStream;
+    DecoderStream videoStream;
+    DecoderStream audioStream;
     AVFrame *avFrame;
-    int videoStreamIdx;
-    int audioStreamIdx;
     VideoCallback videoCallback;
     AudioCallback audioCallback;
     RequestCallback requestCallback;
-    unsigned char *yuvBuffer;
-    //unsigned char *rgbBuffer;
-    unsigned char *pcmBuffer;
-    int currentPcmBufferSize;
-    int videoBufferSize;
-    int videoSize;
     //struct SwsContext* swsCtx;
     unsigned char *customIoBuffer;
     FILE *fp;
@@ -78,6 +106,97 @@ WebDecoder *decoder = NULL;
 LogLevel logLevel = kLogLevel_None;
 
 int getAailableDataSize();
+int streamRead(DecoderStream *stream, uint8_t *data, int len);
+int streamWrite(DecoderStream *stream, unsigned char *buff, int size);
+int streamAvailableDataSize(DecoderStream *stream);
+int64_t streamSeek(DecoderStream *stream, int64_t offset, int whence);
+ErrorCode initStreamBuffer(DecoderStream *stream, int64_t fileSize);
+ErrorCode openStreamDecoder(DecoderStream *stream);
+
+void initDecoderStream(DecoderStream *stream, enum AVMediaType type) {
+    if (stream == NULL) {
+        return;
+    }
+
+    stream->type = type;
+    stream->formatContext = NULL;
+    stream->codecContext = NULL;
+    stream->ioContext = NULL;
+    stream->streamIdx = -1;
+    stream->timeBase.num = 0;
+    stream->timeBase.den = 1;
+    stream->frameBuffer = NULL;
+    stream->bufferCapacity = 0;
+    stream->frameSize = 0;
+    stream->customIoBuffer = NULL;
+    stream->fp = NULL;
+    stream->fileName[0] = '\0';
+    stream->fileSize = 0;
+    stream->fileReadPos = 0;
+    stream->fileWritePos = 0;
+    stream->lastRequestOffset = 0;
+    stream->isStream = 0;
+    stream->fifo = NULL;
+    stream->fifoSize = 0;
+    stream->trackType = (type == AVMEDIA_TYPE_VIDEO) ? TRACK_TYPE_VIDEO : TRACK_TYPE_AUDIO;
+    stream->opened = 0;
+    stream->reachedEof = 0;
+    stream->lastPts = 0.0;
+    stream->hasDecodedFrame = 0;
+}
+
+void releaseDecoderStream(DecoderStream *stream) {
+    if (stream == NULL) {
+        return;
+    }
+
+    if (stream->frameBuffer != NULL) {
+        av_freep(&stream->frameBuffer);
+    }
+
+    if (stream->ioContext != NULL) {
+        avio_context_free(&stream->ioContext);
+        stream->customIoBuffer = NULL;
+    }
+
+    if (stream->formatContext != NULL) {
+        avformat_close_input(&stream->formatContext);
+    }
+
+    if (stream->customIoBuffer != NULL) {
+        av_freep(&stream->customIoBuffer);
+    }
+
+    if (stream->fifo != NULL) {
+        av_fifo_freep(&stream->fifo);
+        stream->fifoSize = 0;
+    }
+
+    if (stream->fp != NULL) {
+        fclose(stream->fp);
+        stream->fp = NULL;
+        if (stream->fileName[0] != '\0') {
+            remove(stream->fileName);
+            stream->fileName[0] = '\0';
+        }
+    }
+
+    stream->bufferCapacity = 0;
+    stream->frameSize = 0;
+    stream->codecContext = NULL;
+    stream->streamIdx = -1;
+    stream->timeBase.num = 0;
+    stream->timeBase.den = 1;
+    stream->fileSize = 0;
+    stream->fileReadPos = 0;
+    stream->fileWritePos = 0;
+    stream->lastRequestOffset = 0;
+    stream->isStream = 0;
+    stream->opened = 0;
+    stream->reachedEof = 0;
+    stream->lastPts = 0.0;
+    stream->hasDecodedFrame = 0;
+}
 
 unsigned long getTickCount() {
     struct timespec ts;
@@ -292,41 +411,64 @@ int roundUp(int numToRound, int multiple) {
 ErrorCode processDecodedVideoFrame(AVFrame *frame) {
     ErrorCode ret = kErrorCode_Success;
     double timestamp = 0.0f;
+    DecoderStream *video = NULL;
     do {
+        if (decoder == NULL) {
+            ret = kErrorCode_Invalid_State;
+            break;
+        }
+
+        video = &decoder->videoStream;
+
         if (frame == NULL ||
             decoder->videoCallback == NULL ||
-            decoder->yuvBuffer == NULL ||
-            decoder->videoBufferSize <= 0) {
+            video->frameBuffer == NULL ||
+            video->bufferCapacity <= 0 ||
+            video->codecContext == NULL) {
             ret = kErrorCode_Invalid_Param;
             break;
         }
 
-        if (decoder->videoCodecContext->pix_fmt != AV_PIX_FMT_YUV420P) {
-            simpleLog("Not YUV420P, but unsupported format %d.", decoder->videoCodecContext->pix_fmt);
+        if (video->codecContext->pix_fmt != AV_PIX_FMT_YUV420P) {
+            simpleLog("Not YUV420P, but unsupported format %d.", video->codecContext->pix_fmt);
             ret = kErrorCode_Invalid_Format;
             break;
         }
 
-        ret = copyYuvData(frame, decoder->yuvBuffer, decoder->videoCodecContext->width, decoder->videoCodecContext->height);
+        ret = copyYuvData(frame, video->frameBuffer, video->codecContext->width, video->codecContext->height);
         if (ret != kErrorCode_Success) {
             break;
         }
 
         /*
-        ret = yuv420pToRgb32(decoder->yuvBuffer, decoder->rgbBuffer, decoder->videoCodecContext->width, decoder->videoCodecContext->height);
+        ret = yuv420pToRgb32(video->frameBuffer, decoder->rgbBuffer, decoder->videoStream.codecContext->width, decoder->videoStream.codecContext->height);
         if (ret != kErrorCode_Success) {
             break;
         }
         */
 
-        timestamp = (double)frame->pts * av_q2d(decoder->avformatContext->streams[decoder->videoStreamIdx]->time_base);
+        int64_t ptsValue = frame->pts;
+        if (ptsValue == AV_NOPTS_VALUE) {
+            ptsValue = frame->best_effort_timestamp;
+        }
+
+        AVRational timeBase;
+        if (decoder->multiStream) {
+            timeBase = video->timeBase;
+        } else {
+            timeBase = decoder->avformatContext->streams[video->streamIdx]->time_base;
+        }
+
+        timestamp = (double)ptsValue * av_q2d(timeBase);
 
         if (decoder->accurateSeek && timestamp < decoder->beginTimeOffset) {
             //simpleLog("video timestamp %lf < %lf", timestamp, decoder->beginTimeOffset);
             ret = kErrorCode_Old_Frame;
             break;
         }
-        decoder->videoCallback(decoder->yuvBuffer, decoder->videoSize, timestamp);
+        decoder->videoCallback(video->frameBuffer, video->frameSize, timestamp);
+        video->lastPts = timestamp;
+        video->hasDecodedFrame = 1;
     } while (0);
     return ret;
 }
@@ -340,79 +482,99 @@ ErrorCode processDecodedAudioFrame(AVFrame *frame) {
     int i               = 0;
     int ch              = 0;
     double timestamp    = 0.0f;
+    DecoderStream *audio = NULL;
     do {
-        if (frame == NULL) {
+        if (decoder == NULL) {
+            ret = kErrorCode_Invalid_State;
+            break;
+        }
+
+        audio = &decoder->audioStream;
+
+        if (frame == NULL || audio->codecContext == NULL) {
             ret = kErrorCode_Invalid_Param;
             break;
         }
 
-        sampleSize = av_get_bytes_per_sample(decoder->audioCodecContext->sample_fmt);
+        sampleSize = av_get_bytes_per_sample(audio->codecContext->sample_fmt);
         if (sampleSize < 0) {
             simpleLog("Failed to calculate data size.");
             ret = kErrorCode_Invalid_Data;
             break;
         }
 
-        if (decoder->pcmBuffer == NULL) {
-            decoder->pcmBuffer = (unsigned char*)av_mallocz(kInitialPcmBufferSize);
-            decoder->currentPcmBufferSize = kInitialPcmBufferSize;
-            simpleLog("Initial PCM buffer size %d.", decoder->currentPcmBufferSize);
+        if (audio->frameBuffer == NULL) {
+            audio->frameBuffer = (unsigned char*)av_mallocz(kInitialPcmBufferSize);
+            audio->bufferCapacity = kInitialPcmBufferSize;
+            simpleLog("Initial PCM buffer size %d.", audio->bufferCapacity);
         }
 
-        audioDataSize = frame->nb_samples * decoder->audioCodecContext->channels * sampleSize;
-        if (decoder->currentPcmBufferSize < audioDataSize) {
+        audioDataSize = frame->nb_samples * audio->codecContext->channels * sampleSize;
+        if (audio->bufferCapacity < audioDataSize) {
             targetSize = roundUp(audioDataSize, 4);
             simpleLog("Current PCM buffer size %d not sufficient for data size %d, round up to target %d.",
-                decoder->currentPcmBufferSize,
+                audio->bufferCapacity,
                 audioDataSize,
                 targetSize);
-            decoder->currentPcmBufferSize = targetSize;
-            av_free(decoder->pcmBuffer);
-            decoder->pcmBuffer = (unsigned char*)av_mallocz(decoder->currentPcmBufferSize);
+            audio->bufferCapacity = targetSize;
+            av_free(audio->frameBuffer);
+            audio->frameBuffer = (unsigned char*)av_mallocz(audio->bufferCapacity);
         }
 
         for (i = 0; i < frame->nb_samples; i++) {
-            for (ch = 0; ch < decoder->audioCodecContext->channels; ch++) {
-                memcpy(decoder->pcmBuffer + offset, frame->data[ch] + sampleSize * i, sampleSize);
+            for (ch = 0; ch < audio->codecContext->channels; ch++) {
+                memcpy(audio->frameBuffer + offset, frame->data[ch] + sampleSize * i, sampleSize);
                 offset += sampleSize;
             }
         }
 
-        timestamp = (double)frame->pts * av_q2d(decoder->avformatContext->streams[decoder->audioStreamIdx]->time_base);
+        int64_t ptsValue = frame->pts;
+        if (ptsValue == AV_NOPTS_VALUE) {
+            ptsValue = frame->best_effort_timestamp;
+        }
+
+        AVRational timeBase;
+        if (decoder->multiStream) {
+            timeBase = audio->timeBase;
+        } else {
+            timeBase = decoder->avformatContext->streams[audio->streamIdx]->time_base;
+        }
+
+        timestamp = (double)ptsValue * av_q2d(timeBase);
 
         if (decoder->accurateSeek && timestamp < decoder->beginTimeOffset) {
             //simpleLog("audio timestamp %lf < %lf", timestamp, decoder->beginTimeOffset);
             ret = kErrorCode_Old_Frame;
             break;
         }
+        audio->frameSize = audioDataSize;
         if (decoder->audioCallback != NULL) {
-            decoder->audioCallback(decoder->pcmBuffer, audioDataSize, timestamp);
+            decoder->audioCallback(audio->frameBuffer, audioDataSize, timestamp);
         }
+        audio->lastPts = timestamp;
+        audio->hasDecodedFrame = 1;
     } while (0);
     return ret;
 }
 
-ErrorCode decodePacket(AVPacket *pkt, int *decodedLen) {
+ErrorCode decodePacket(DecoderStream *stream, AVPacket *pkt, int *decodedLen) {
     int ret = 0;
     int isVideo = 0;
     AVCodecContext *codecContext = NULL;
 
-    if (pkt == NULL || decodedLen == NULL) {
+    if (stream == NULL || pkt == NULL || decodedLen == NULL) {
         simpleLog("decodePacket invalid param.");
         return kErrorCode_Invalid_Param;
     }
 
     *decodedLen = 0;
 
-    if (pkt->stream_index == decoder->videoStreamIdx) {
-        codecContext = decoder->videoCodecContext;
-        isVideo = 1;
-    } else if (pkt->stream_index == decoder->audioStreamIdx) {
-        codecContext = decoder->audioCodecContext;
-        isVideo = 0;
-    } else {
-        return kErrorCode_Invalid_Data;
+    codecContext = stream->codecContext;
+    if (codecContext == NULL) {
+        return kErrorCode_Invalid_State;
     }
+
+    isVideo = (stream->type == AVMEDIA_TYPE_VIDEO);
 
     ret = avcodec_send_packet(codecContext, pkt);
     if (ret < 0) {
@@ -439,6 +601,82 @@ ErrorCode decodePacket(AVPacket *pkt, int *decodedLen) {
 
     *decodedLen = pkt->size;
     return kErrorCode_Success;
+}
+
+DecoderStream* selectNextStreamForDecode() {
+    DecoderStream *video = &decoder->videoStream;
+    DecoderStream *audio = &decoder->audioStream;
+
+    if (video->reachedEof && audio->reachedEof) {
+        return NULL;
+    }
+
+    if (!video->reachedEof && !video->hasDecodedFrame) {
+        return video;
+    }
+
+    if (!audio->reachedEof && !audio->hasDecodedFrame) {
+        return audio;
+    }
+
+    if (video->reachedEof) {
+        return audio;
+    }
+
+    if (audio->reachedEof) {
+        return video;
+    }
+
+    return (video->lastPts <= audio->lastPts) ? video : audio;
+}
+
+ErrorCode decodeStreamPacket(DecoderStream *stream) {
+    if (stream == NULL || stream->formatContext == NULL) {
+        return kErrorCode_Invalid_State;
+    }
+
+    ErrorCode ret = kErrorCode_Success;
+    int decodedLen = 0;
+    int r = 0;
+    AVPacket packet;
+    av_init_packet(&packet);
+    packet.data = NULL;
+    packet.size = 0;
+
+    r = av_read_frame(stream->formatContext, &packet);
+    if (r == AVERROR_EOF) {
+        stream->reachedEof = 1;
+        ret = kErrorCode_Eof;
+        goto end;
+    }
+
+    if (r == AVERROR(EAGAIN)) {
+        ret = kErrorCode_Invalid_State;
+        goto end;
+    }
+
+    if (r < 0 || packet.size == 0) {
+        ret = kErrorCode_FFmpeg_Error;
+        goto end;
+    }
+
+    do {
+        ret = decodePacket(stream, &packet, &decodedLen);
+        if (ret != kErrorCode_Success) {
+            break;
+        }
+
+        if (decodedLen <= 0) {
+            break;
+        }
+
+        packet.data += decodedLen;
+        packet.size -= decodedLen;
+    } while (packet.size > 0);
+
+end:
+    av_packet_unref(&packet);
+    return ret;
 }
 
 int readFromFile(uint8_t *data, int len) {
@@ -489,6 +727,266 @@ int readFromFifo(uint8_t *data, int len) {
     return ret;
 }
 
+int streamRead(DecoderStream *stream, uint8_t *data, int len) {
+    if (stream == NULL || data == NULL || len <= 0) {
+        return -1;
+    }
+
+    if (stream->isStream) {
+        if (stream->fifo == NULL) {
+            return -1;
+        }
+
+        int availableBytes = av_fifo_size(stream->fifo);
+        if (availableBytes <= 0) {
+            return -1;
+        }
+
+        int canReadLen = MIN(availableBytes, len);
+        av_fifo_generic_read(stream->fifo, data, canReadLen, NULL);
+        return canReadLen;
+    }
+
+    if (stream->fp == NULL) {
+        return -1;
+    }
+
+    int64_t availableBytes = stream->fileWritePos - stream->fileReadPos;
+    if (availableBytes <= 0) {
+        return -1;
+    }
+
+    int canReadLen = MIN(availableBytes, len);
+    fseek(stream->fp, stream->fileReadPos, SEEK_SET);
+    fread(data, canReadLen, 1, stream->fp);
+    stream->fileReadPos += canReadLen;
+    return canReadLen;
+}
+
+int streamWrite(DecoderStream *stream, unsigned char *buff, int size) {
+    if (stream == NULL || buff == NULL || size <= 0) {
+        return -1;
+    }
+
+    if (stream->isStream) {
+        if (stream->fifo == NULL) {
+            return -1;
+        }
+
+        int64_t leftSpace = av_fifo_space(stream->fifo);
+        if (leftSpace < size) {
+            int growSize = 0;
+            do {
+                leftSpace += stream->fifoSize;
+                growSize += stream->fifoSize;
+                stream->fifoSize += stream->fifoSize;
+            } while (leftSpace < size);
+            av_fifo_grow(stream->fifo, growSize);
+
+            simpleLog("Fifo size growed to %d for track %d.", stream->fifoSize, stream->trackType);
+            if (stream->fifoSize >= kMaxFifoSize) {
+                simpleLog("[Warn] Fifo size larger than %d.", kMaxFifoSize);
+            }
+        }
+
+        return av_fifo_generic_write(stream->fifo, buff, size, NULL);
+    }
+
+    if (stream->fp == NULL) {
+        return -1;
+    }
+
+    int64_t leftBytes = stream->fileSize - stream->fileWritePos;
+    if (leftBytes <= 0) {
+        return 0;
+    }
+
+    int canWriteBytes = MIN(leftBytes, size);
+    fseek(stream->fp, stream->fileWritePos, SEEK_SET);
+    fwrite(buff, canWriteBytes, 1, stream->fp);
+    stream->fileWritePos += canWriteBytes;
+    return canWriteBytes;
+}
+
+int streamAvailableDataSize(DecoderStream *stream) {
+    if (stream == NULL) {
+        return 0;
+    }
+
+    if (stream->isStream) {
+        return stream->fifo == NULL ? 0 : av_fifo_size(stream->fifo);
+    }
+
+    return stream->fileWritePos - stream->fileReadPos;
+}
+
+int64_t streamSeek(DecoderStream *stream, int64_t offset, int whence) {
+    if (stream == NULL || stream->isStream || stream->fp == NULL) {
+        return -1;
+    }
+
+    if (whence == AVSEEK_SIZE) {
+        return stream->fileSize;
+    }
+
+    if (whence != SEEK_END && whence != SEEK_SET && whence != SEEK_CUR) {
+        return -1;
+    }
+
+    int ret = fseek(stream->fp, (long)offset, whence);
+    if (ret == -1) {
+        return -1;
+    }
+
+    int64_t pos = (int64_t)ftell(stream->fp);
+    if (pos < stream->lastRequestOffset || pos > stream->fileWritePos) {
+        stream->lastRequestOffset = pos;
+        stream->fileReadPos = pos;
+        stream->fileWritePos = pos;
+        if (decoder != NULL && decoder->requestCallback != NULL) {
+            decoder->requestCallback(stream->trackType, (int)pos, streamAvailableDataSize(stream));
+        }
+        return -1;
+    }
+
+    stream->fileReadPos = pos;
+    return pos;
+}
+
+ErrorCode initStreamBuffer(DecoderStream *stream, int64_t fileSize) {
+    if (stream == NULL) {
+        return kErrorCode_Invalid_Param;
+    }
+
+    if (fileSize >= 0) {
+        stream->fileSize = fileSize;
+        sprintf(stream->fileName, "tmp-%s-%lu.dat",
+            stream->trackType == TRACK_TYPE_VIDEO ? "video" : "audio",
+            getTickCount());
+        stream->fp = fopen(stream->fileName, "wb+");
+        if (stream->fp == NULL) {
+            simpleLog("Open file %s failed, err: %d.", stream->fileName, errno);
+            return kErrorCode_Open_File_Error;
+        }
+    } else {
+        stream->isStream = 1;
+        stream->fifoSize = kDefaultFifoSize;
+        stream->fifo = av_fifo_alloc(stream->fifoSize);
+        if (stream->fifo == NULL) {
+            return kErrorCode_Invalid_State;
+        }
+    }
+
+    return kErrorCode_Success;
+}
+
+ErrorCode openStreamDecoder(DecoderStream *stream) {
+    if (stream == NULL) {
+        return kErrorCode_Invalid_Param;
+    }
+
+    ErrorCode ret = kErrorCode_Success;
+    int r = 0;
+
+    stream->formatContext = avformat_alloc_context();
+    if (stream->formatContext == NULL) {
+        return kErrorCode_Invalid_State;
+    }
+
+    stream->customIoBuffer = (unsigned char*)av_mallocz(kCustomIoBufferSize);
+    if (stream->customIoBuffer == NULL) {
+        ret = kErrorCode_Invalid_State;
+        goto fail;
+    }
+
+    stream->ioContext = avio_alloc_context(
+        stream->customIoBuffer,
+        kCustomIoBufferSize,
+        0,
+        stream,
+        readCallback,
+        NULL,
+        stream->isStream ? NULL : seekCallback);
+    if (stream->ioContext == NULL) {
+        simpleLog("avio_alloc_context failed for track %d.", stream->trackType);
+        ret = kErrorCode_FFmpeg_Error;
+        goto fail;
+    }
+
+    stream->formatContext->pb = stream->ioContext;
+    stream->formatContext->flags = AVFMT_FLAG_CUSTOM_IO;
+
+    r = avformat_open_input(&stream->formatContext, NULL, NULL, NULL);
+    if (r != 0) {
+        char err_info[32] = { 0 };
+        av_strerror(r, err_info, 32);
+        simpleLog("avformat_open_input failed for track %d %d %s.", stream->trackType, r, err_info);
+        ret = kErrorCode_FFmpeg_Error;
+        goto fail;
+    }
+
+    r = avformat_find_stream_info(stream->formatContext, NULL);
+    if (r != 0) {
+        simpleLog("avformat_find_stream_info failed for track %d %d.", stream->trackType, r);
+        ret = kErrorCode_FFmpeg_Error;
+        goto fail;
+    }
+
+    r = openCodecContext(
+        stream->formatContext,
+        stream->type,
+        &stream->streamIdx,
+        &stream->codecContext);
+    if (r != 0) {
+        simpleLog("Open codec context failed for track %d %d.", stream->trackType, r);
+        ret = kErrorCode_FFmpeg_Error;
+        goto fail;
+    }
+
+    stream->timeBase = stream->formatContext->streams[stream->streamIdx]->time_base;
+    stream->opened = 1;
+    stream->reachedEof = 0;
+    stream->hasDecodedFrame = 0;
+    stream->lastPts = 0.0;
+
+    avcodec_flush_buffers(stream->codecContext);
+
+    return ret;
+
+fail:
+    if (stream->codecContext != NULL) {
+        avcodec_close(stream->codecContext);
+        avcodec_free_context(&stream->codecContext);
+        stream->codecContext = NULL;
+    }
+    stream->streamIdx = -1;
+
+    if (stream->ioContext != NULL) {
+        avio_context_free(&stream->ioContext);
+        stream->customIoBuffer = NULL;
+    }
+
+    if (stream->customIoBuffer != NULL) {
+        av_freep(&stream->customIoBuffer);
+    }
+
+    if (stream->formatContext != NULL) {
+        if (stream->formatContext->iformat != NULL) {
+            avformat_close_input(&stream->formatContext);
+        } else {
+            avformat_free_context(stream->formatContext);
+            stream->formatContext = NULL;
+        }
+    }
+
+    stream->opened = 0;
+    stream->reachedEof = 0;
+    stream->hasDecodedFrame = 0;
+    stream->lastPts = 0.0;
+
+    return ret;
+}
+
 int readCallback(void *opaque, uint8_t *data, int len) {
     //simpleLog("readCallback %d.", len);
     int32_t ret         = -1;
@@ -499,9 +997,17 @@ int readCallback(void *opaque, uint8_t *data, int len) {
 
         if (data == NULL || len <= 0) {
             break;
-        }		
+        }
 
-        ret = decoder->isStream ? readFromFifo(data, len) : readFromFile(data, len);
+        DecoderStream *stream = (DecoderStream *)opaque;
+        if (stream != NULL) {
+            ret = streamRead(stream, data, len);
+            if (ret < 0 && decoder->requestCallback != NULL) {
+                decoder->requestCallback(stream->trackType, -1, streamAvailableDataSize(stream));
+            }
+        } else {
+            ret = decoder->isStream ? readFromFifo(data, len) : readFromFile(data, len);
+        }
     } while (0);
     //simpleLog("readCallback ret %d.", ret);
     return ret;
@@ -513,6 +1019,12 @@ int64_t seekCallback(void *opaque, int64_t offset, int whence) {
     int64_t req_pos     = -1;
     //simpleLog("seekCallback %lld %d.", offset, whence);
     do {
+        DecoderStream *stream = (DecoderStream *)opaque;
+        if (stream != NULL) {
+            ret = streamSeek(stream, offset, whence);
+            break;
+        }
+
         if (decoder == NULL || decoder->isStream || decoder->fp == NULL) {
             break;
         }
@@ -549,7 +1061,12 @@ int64_t seekCallback(void *opaque, int64_t offset, int whence) {
     //simpleLog("seekCallback return %lld.", ret);
 
     if (decoder != NULL && decoder->requestCallback != NULL) {
-        decoder->requestCallback(req_pos, getAailableDataSize());
+        DecoderStream *stream = (DecoderStream *)opaque;
+        if (stream != NULL) {
+            decoder->requestCallback(stream->trackType, (int)req_pos, streamAvailableDataSize(stream));
+        } else {
+            decoder->requestCallback(TRACK_TYPE_VIDEO, req_pos, getAailableDataSize());
+        }
     }
     return ret;
 }
@@ -615,7 +1132,10 @@ int getAailableDataSize() {
             break;
         }
 
-        if (decoder->isStream) {
+        if (decoder->multiStream) {
+            ret = streamAvailableDataSize(&decoder->videoStream) +
+                  streamAvailableDataSize(&decoder->audioStream);
+        } else if (decoder->isStream) {
             ret = decoder->fifo == NULL ? 0 : av_fifo_size(decoder->fifo);
         } else {
             ret = decoder->fileWritePos - decoder->fileReadPos;
@@ -625,7 +1145,7 @@ int getAailableDataSize() {
 }
 
 //////////////////////////////////Export methods////////////////////////////////////////
-ErrorCode initDecoder(int fileSize, int logLv) {
+ErrorCode initDecoder(int videoFileSize, int audioFileSize, int logLv) {
     ErrorCode ret = kErrorCode_Success;
     do {
         //Log level.
@@ -636,22 +1156,64 @@ ErrorCode initDecoder(int fileSize, int logLv) {
         }
 
         decoder = (WebDecoder *)av_mallocz(sizeof(WebDecoder));
-        if (fileSize >= 0) {
-            decoder->fileSize = fileSize;
-            sprintf(decoder->fileName, "tmp-%lu.mp4", getTickCount());
-            decoder->fp = fopen(decoder->fileName, "wb+");
-            if (decoder->fp == NULL) {
-                simpleLog("Open file %s failed, err: %d.", decoder->fileName, errno);
-                ret = kErrorCode_Open_File_Error;
-                av_free(decoder);
-                decoder = NULL;
+        if (decoder == NULL) {
+            ret = kErrorCode_Invalid_State;
+            break;
+        }
+
+        initDecoderStream(&decoder->videoStream, AVMEDIA_TYPE_VIDEO);
+        initDecoderStream(&decoder->audioStream, AVMEDIA_TYPE_AUDIO);
+
+        decoder->multiStream = (audioFileSize != kSeparateStreamDisabled);
+
+        if (decoder->multiStream) {
+            ret = initStreamBuffer(&decoder->videoStream, videoFileSize);
+            if (ret != kErrorCode_Success) {
+                break;
+            }
+
+            ret = initStreamBuffer(&decoder->audioStream, audioFileSize);
+            if (ret != kErrorCode_Success) {
+                break;
             }
         } else {
-            decoder->isStream = 1;
-            decoder->fifoSize = kDefaultFifoSize;
-            decoder->fifo = av_fifo_alloc(decoder->fifoSize);
+            if (videoFileSize >= 0) {
+                decoder->fileSize = videoFileSize;
+                sprintf(decoder->fileName, "tmp-%lu.mp4", getTickCount());
+                decoder->fp = fopen(decoder->fileName, "wb+");
+                if (decoder->fp == NULL) {
+                    simpleLog("Open file %s failed, err: %d.", decoder->fileName, errno);
+                    ret = kErrorCode_Open_File_Error;
+                    break;
+                }
+            } else {
+                decoder->isStream = 1;
+                decoder->fifoSize = kDefaultFifoSize;
+                decoder->fifo = av_fifo_alloc(decoder->fifoSize);
+                if (decoder->fifo == NULL) {
+                    ret = kErrorCode_Invalid_State;
+                    break;
+                }
+            }
         }
     } while (0);
+    if (ret != kErrorCode_Success) {
+        if (decoder != NULL) {
+            if (!decoder->multiStream) {
+                if (decoder->fp != NULL) {
+                    fclose(decoder->fp);
+                    decoder->fp = NULL;
+                    remove(decoder->fileName);
+                }
+                if (decoder->fifo != NULL) {
+                    av_fifo_freep(&decoder->fifo);
+                }
+            }
+            releaseDecoderStream(&decoder->videoStream);
+            releaseDecoderStream(&decoder->audioStream);
+            av_freep(&decoder);
+        }
+    }
     simpleLog("Decoder initialized %d.", ret);
     return ret;
 }
@@ -667,6 +1229,9 @@ ErrorCode uninitDecoder() {
         if (decoder->fifo != NULL) {
              av_fifo_freep(&decoder->fifo);
         }
+
+        releaseDecoderStream(&decoder->videoStream);
+        releaseDecoderStream(&decoder->audioStream);
 
         av_freep(&decoder);
     }
@@ -691,149 +1256,208 @@ ErrorCode openDecoder(int *paramArray, int paramCount, long videoCallback, long 
         if (logLevel == kLogLevel_All) {
             av_log_set_callback(ffmpegLogCallback);
         }
-        
-        decoder->avformatContext = avformat_alloc_context();
-        decoder->customIoBuffer = (unsigned char*)av_mallocz(kCustomIoBufferSize);
-
-        AVIOContext* ioContext = avio_alloc_context(
-            decoder->customIoBuffer,
-            kCustomIoBufferSize,
-            0,
-            NULL,
-            readCallback,
-            NULL,
-            seekCallback);
-        if (ioContext == NULL) {
-            ret = kErrorCode_FFmpeg_Error;
-            simpleLog("avio_alloc_context failed.");
-            break;
-        }
-
-        decoder->avformatContext->pb = ioContext;
-        decoder->avformatContext->flags = AVFMT_FLAG_CUSTOM_IO;
-
-        r = avformat_open_input(&decoder->avformatContext, NULL, NULL, NULL);
-        if (r != 0) {
-            ret = kErrorCode_FFmpeg_Error;
-            char err_info[32] = { 0 };
-            av_strerror(ret, err_info, 32);
-            simpleLog("avformat_open_input failed %d %s.", ret, err_info);
-            break;
-        }
-        
-        simpleLog("avformat_open_input success.");
-
-        r = avformat_find_stream_info(decoder->avformatContext, NULL);
-        if (r != 0) {
-            ret = kErrorCode_FFmpeg_Error;
-            simpleLog("av_find_stream_info failed %d.", ret);
-            break;
-        }
-
-        simpleLog("avformat_find_stream_info success.");
-
-        for (i = 0; i < decoder->avformatContext->nb_streams; i++) {
-            decoder->avformatContext->streams[i]->discard = AVDISCARD_DEFAULT;
-        }
-
-        r = openCodecContext(
-            decoder->avformatContext,
-            AVMEDIA_TYPE_VIDEO,
-            &decoder->videoStreamIdx,
-            &decoder->videoCodecContext);
-        if (r != 0) {
-            ret = kErrorCode_FFmpeg_Error;
-            simpleLog("Open video codec context failed %d.", ret);
-            break;
-        }
-
-        simpleLog("Open video codec context success, video stream index %d %x.",
-            decoder->videoStreamIdx, (unsigned int)decoder->videoCodecContext);
-
-        simpleLog("Video stream index:%d pix_fmt:%d resolution:%d*%d.",
-            decoder->videoStreamIdx,
-            decoder->videoCodecContext->pix_fmt,
-            decoder->videoCodecContext->width,
-            decoder->videoCodecContext->height);
-
-        r = openCodecContext(
-            decoder->avformatContext,
-            AVMEDIA_TYPE_AUDIO,
-            &decoder->audioStreamIdx,
-            &decoder->audioCodecContext);
-        if (r != 0) {
-            ret = kErrorCode_FFmpeg_Error;
-            simpleLog("Open audio codec context failed %d.", ret);
-            break;
-        }
-
-        simpleLog("Open audio codec context success, audio stream index %d %x.",
-            decoder->audioStreamIdx, (unsigned int)decoder->audioCodecContext);
-
-        simpleLog("Audio stream index:%d sample_fmt:%d channel:%d, sample rate:%d.",
-            decoder->audioStreamIdx,
-            decoder->audioCodecContext->sample_fmt,
-            decoder->audioCodecContext->channels,
-            decoder->audioCodecContext->sample_rate);
-
-        av_seek_frame(decoder->avformatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
-
-        /* For RGB Renderer(2D WebGL).
-        decoder->swsCtx = sws_getContext(
-            decoder->videoCodecContext->width,
-            decoder->videoCodecContext->height,
-            decoder->videoCodecContext->pix_fmt, 
-            decoder->videoCodecContext->width,
-            decoder->videoCodecContext->height,
-            AV_PIX_FMT_RGB32,
-            SWS_BILINEAR, 
-            0, 
-            0, 
-            0);
-        if (decoder->swsCtx == NULL) {
-            simpleLog("sws_getContext failed.");
-            ret = kErrorCode_FFmpeg_Error;
-            break;
-        }
-        */
-        
-        decoder->videoSize = avpicture_get_size(
-            decoder->videoCodecContext->pix_fmt,
-            decoder->videoCodecContext->width,
-            decoder->videoCodecContext->height);
-
-        decoder->videoBufferSize = 3 * decoder->videoSize;
-        decoder->yuvBuffer = (unsigned char *)av_mallocz(decoder->videoBufferSize);
-        decoder->avFrame = av_frame_alloc();
-        
-        params[0] = 1000 * (decoder->avformatContext->duration + 5000) / AV_TIME_BASE;
-        params[1] = decoder->videoCodecContext->pix_fmt;
-        params[2] = decoder->videoCodecContext->width;
-        params[3] = decoder->videoCodecContext->height;
-        params[4] = decoder->audioCodecContext->sample_fmt;
-        params[5] = decoder->audioCodecContext->channels;
-        params[6] = decoder->audioCodecContext->sample_rate;
-
-        enum AVSampleFormat sampleFmt = decoder->audioCodecContext->sample_fmt;
-        if (av_sample_fmt_is_planar(sampleFmt)) {
-            const char *packed = av_get_sample_fmt_name(sampleFmt);
-            params[4] = av_get_packed_sample_fmt(sampleFmt);
-        }
-
-        if (paramArray != NULL && paramCount > 0) {
-            for (int i = 0; i < paramCount; ++i) {
-                paramArray[i] = params[i];
-            }
-        }
 
         decoder->videoCallback = (VideoCallback)videoCallback;
         decoder->audioCallback = (AudioCallback)audioCallback;
         decoder->requestCallback = (RequestCallback)requestCallback;
 
-        simpleLog("Decoder opened, duration %ds, picture size %d.", params[0], decoder->videoSize);
+        if (decoder->multiStream) {
+            ret = openStreamDecoder(&decoder->videoStream);
+            if (ret != kErrorCode_Success) {
+                break;
+            }
+
+            ret = openStreamDecoder(&decoder->audioStream);
+            if (ret != kErrorCode_Success) {
+                break;
+            }
+
+            av_seek_frame(decoder->videoStream.formatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
+            av_seek_frame(decoder->audioStream.formatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
+
+            decoder->videoStream.frameSize = avpicture_get_size(
+                decoder->videoStream.codecContext->pix_fmt,
+                decoder->videoStream.codecContext->width,
+                decoder->videoStream.codecContext->height);
+
+            decoder->videoStream.bufferCapacity = 3 * decoder->videoStream.frameSize;
+            decoder->videoStream.frameBuffer = (unsigned char *)av_mallocz(decoder->videoStream.bufferCapacity);
+            if (decoder->videoStream.frameBuffer == NULL) {
+                ret = kErrorCode_Invalid_State;
+                break;
+            }
+
+            if (decoder->avFrame == NULL) {
+                decoder->avFrame = av_frame_alloc();
+            }
+
+            if (decoder->avFrame == NULL) {
+                ret = kErrorCode_Invalid_State;
+                break;
+            }
+
+            int64_t duration = decoder->videoStream.formatContext->duration;
+            if (duration <= 0 && decoder->audioStream.formatContext != NULL) {
+                duration = decoder->audioStream.formatContext->duration;
+            }
+
+            params[0] = duration > 0 ? (int)(1000 * (duration + 5000) / AV_TIME_BASE) : 0;
+            params[1] = decoder->videoStream.codecContext->pix_fmt;
+            params[2] = decoder->videoStream.codecContext->width;
+            params[3] = decoder->videoStream.codecContext->height;
+            params[4] = decoder->audioStream.codecContext->sample_fmt;
+            params[5] = decoder->audioStream.codecContext->channels;
+            params[6] = decoder->audioStream.codecContext->sample_rate;
+        } else {
+            decoder->avformatContext = avformat_alloc_context();
+            decoder->customIoBuffer = (unsigned char*)av_mallocz(kCustomIoBufferSize);
+            if (decoder->customIoBuffer == NULL) {
+                ret = kErrorCode_Invalid_State;
+                break;
+            }
+
+            AVIOContext* ioContext = avio_alloc_context(
+                decoder->customIoBuffer,
+                kCustomIoBufferSize,
+                0,
+                NULL,
+                readCallback,
+                NULL,
+                seekCallback);
+            if (ioContext == NULL) {
+                ret = kErrorCode_FFmpeg_Error;
+                simpleLog("avio_alloc_context failed.");
+                break;
+            }
+
+            decoder->avformatContext->pb = ioContext;
+            decoder->avformatContext->flags = AVFMT_FLAG_CUSTOM_IO;
+
+            r = avformat_open_input(&decoder->avformatContext, NULL, NULL, NULL);
+            if (r != 0) {
+                ret = kErrorCode_FFmpeg_Error;
+                char err_info[32] = { 0 };
+                av_strerror(r, err_info, 32);
+                simpleLog("avformat_open_input failed %d %s.", r, err_info);
+                break;
+            }
+
+            r = avformat_find_stream_info(decoder->avformatContext, NULL);
+            if (r != 0) {
+                ret = kErrorCode_FFmpeg_Error;
+                simpleLog("av_find_stream_info failed %d.", r);
+                break;
+            }
+
+            for (i = 0; i < decoder->avformatContext->nb_streams; i++) {
+                decoder->avformatContext->streams[i]->discard = AVDISCARD_DEFAULT;
+            }
+
+            r = openCodecContext(
+                decoder->avformatContext,
+                AVMEDIA_TYPE_VIDEO,
+                &decoder->videoStream.streamIdx,
+                &decoder->videoStream.codecContext);
+            if (r != 0) {
+                ret = kErrorCode_FFmpeg_Error;
+                simpleLog("Open video codec context failed %d.", r);
+                break;
+            }
+
+            r = openCodecContext(
+                decoder->avformatContext,
+                AVMEDIA_TYPE_AUDIO,
+                &decoder->audioStream.streamIdx,
+                &decoder->audioStream.codecContext);
+            if (r != 0) {
+                ret = kErrorCode_FFmpeg_Error;
+                simpleLog("Open audio codec context failed %d.", r);
+                break;
+            }
+
+            decoder->videoStream.timeBase = decoder->avformatContext->streams[decoder->videoStream.streamIdx]->time_base;
+            decoder->audioStream.timeBase = decoder->avformatContext->streams[decoder->audioStream.streamIdx]->time_base;
+            decoder->videoStream.opened = 1;
+            decoder->audioStream.opened = 1;
+            decoder->videoStream.reachedEof = 0;
+            decoder->audioStream.reachedEof = 0;
+            decoder->videoStream.hasDecodedFrame = 0;
+            decoder->audioStream.hasDecodedFrame = 0;
+
+            av_seek_frame(decoder->avformatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
+
+            decoder->videoStream.frameSize = avpicture_get_size(
+                decoder->videoStream.codecContext->pix_fmt,
+                decoder->videoStream.codecContext->width,
+                decoder->videoStream.codecContext->height);
+
+            decoder->videoStream.bufferCapacity = 3 * decoder->videoStream.frameSize;
+            decoder->videoStream.frameBuffer = (unsigned char *)av_mallocz(decoder->videoStream.bufferCapacity);
+            decoder->avFrame = av_frame_alloc();
+            if (decoder->videoStream.frameBuffer == NULL || decoder->avFrame == NULL) {
+                ret = kErrorCode_Invalid_State;
+                break;
+            }
+
+            params[0] = decoder->avformatContext->duration > 0 ?
+                1000 * (decoder->avformatContext->duration + 5000) / AV_TIME_BASE : 0;
+            params[1] = decoder->videoStream.codecContext->pix_fmt;
+            params[2] = decoder->videoStream.codecContext->width;
+            params[3] = decoder->videoStream.codecContext->height;
+            params[4] = decoder->audioStream.codecContext->sample_fmt;
+            params[5] = decoder->audioStream.codecContext->channels;
+            params[6] = decoder->audioStream.codecContext->sample_rate;
+        }
+
+        enum AVSampleFormat sampleFmt = decoder->audioStream.codecContext->sample_fmt;
+        if (av_sample_fmt_is_planar(sampleFmt)) {
+            params[4] = av_get_packed_sample_fmt(sampleFmt);
+        }
+
+        if (paramArray != NULL && paramCount > 0) {
+            for (int j = 0; j < paramCount && j < 7; ++j) {
+                paramArray[j] = params[j];
+            }
+        }
+
+        simpleLog("Decoder opened, duration %ds, picture size %d.", params[0], decoder->videoStream.frameSize);
     } while (0);
 
     if (ret != kErrorCode_Success && decoder != NULL) {
+        if (decoder->multiStream) {
+            if (decoder->videoStream.codecContext != NULL) {
+                closeCodecContext(decoder->videoStream.formatContext, decoder->videoStream.codecContext, decoder->videoStream.streamIdx);
+                decoder->videoStream.codecContext = NULL;
+            }
+
+            if (decoder->audioStream.codecContext != NULL) {
+                closeCodecContext(decoder->audioStream.formatContext, decoder->audioStream.codecContext, decoder->audioStream.streamIdx);
+                decoder->audioStream.codecContext = NULL;
+            }
+
+            releaseDecoderStream(&decoder->videoStream);
+            releaseDecoderStream(&decoder->audioStream);
+        } else {
+            if (decoder->avformatContext != NULL) {
+                if (decoder->videoStream.codecContext != NULL) {
+                    closeCodecContext(decoder->avformatContext, decoder->videoStream.codecContext, decoder->videoStream.streamIdx);
+                    decoder->videoStream.codecContext = NULL;
+                }
+
+                if (decoder->audioStream.codecContext != NULL) {
+                    closeCodecContext(decoder->avformatContext, decoder->audioStream.codecContext, decoder->audioStream.streamIdx);
+                    decoder->audioStream.codecContext = NULL;
+                }
+
+                avformat_close_input(&decoder->avformatContext);
+            }
+
+            releaseDecoderStream(&decoder->videoStream);
+            releaseDecoderStream(&decoder->audioStream);
+            if (decoder->customIoBuffer != NULL) {
+                av_freep(&decoder->customIoBuffer);
+            }
+        }
         av_freep(&decoder);
     }
     return ret;
@@ -842,44 +1466,72 @@ ErrorCode openDecoder(int *paramArray, int paramCount, long videoCallback, long 
 ErrorCode closeDecoder() {
     ErrorCode ret = kErrorCode_Success;
     do {
-        if (decoder == NULL || decoder->avformatContext == NULL) {
+        if (decoder == NULL) {
             break;
         }
 
-        if (decoder->videoCodecContext != NULL) {
-            closeCodecContext(decoder->avformatContext, decoder->videoCodecContext, decoder->videoStreamIdx);
-            decoder->videoCodecContext = NULL;
-            simpleLog("Video codec context closed.");
-        }
-
-        if (decoder->audioCodecContext != NULL) {
-            closeCodecContext(decoder->avformatContext, decoder->audioCodecContext, decoder->audioStreamIdx);
-            decoder->audioCodecContext = NULL;
-            simpleLog("Audio codec context closed.");
-        }
-
-        AVIOContext *pb = decoder->avformatContext->pb;
-        if (pb != NULL) {
-            if (pb->buffer != NULL) {
-                av_freep(&pb->buffer);
-                decoder->customIoBuffer = NULL;
+        if (decoder->multiStream) {
+            if (decoder->videoStream.codecContext != NULL) {
+                closeCodecContext(decoder->videoStream.formatContext, decoder->videoStream.codecContext, decoder->videoStream.streamIdx);
+                decoder->videoStream.codecContext = NULL;
+                simpleLog("Video codec context closed.");
             }
-            av_freep(&decoder->avformatContext->pb);
-            simpleLog("IO context released.");
+
+            if (decoder->videoStream.formatContext != NULL) {
+                avformat_close_input(&decoder->videoStream.formatContext);
+            }
+
+            releaseDecoderStream(&decoder->videoStream);
+
+            if (decoder->audioStream.codecContext != NULL) {
+                closeCodecContext(decoder->audioStream.formatContext, decoder->audioStream.codecContext, decoder->audioStream.streamIdx);
+                decoder->audioStream.codecContext = NULL;
+                simpleLog("Audio codec context closed.");
+            }
+
+            if (decoder->audioStream.formatContext != NULL) {
+                avformat_close_input(&decoder->audioStream.formatContext);
+            }
+
+            releaseDecoderStream(&decoder->audioStream);
+        } else {
+            if (decoder->avformatContext == NULL) {
+                break;
+            }
+
+            if (decoder->videoStream.codecContext != NULL) {
+                closeCodecContext(decoder->avformatContext, decoder->videoStream.codecContext, decoder->videoStream.streamIdx);
+                decoder->videoStream.codecContext = NULL;
+                simpleLog("Video codec context closed.");
+            }
+
+            if (decoder->audioStream.codecContext != NULL) {
+                closeCodecContext(decoder->avformatContext, decoder->audioStream.codecContext, decoder->audioStream.streamIdx);
+                decoder->audioStream.codecContext = NULL;
+                simpleLog("Audio codec context closed.");
+            }
+
+            AVIOContext *pb = decoder->avformatContext->pb;
+            if (pb != NULL) {
+                if (pb->buffer != NULL) {
+                    av_freep(&pb->buffer);
+                    decoder->customIoBuffer = NULL;
+                }
+                av_freep(&decoder->avformatContext->pb);
+                simpleLog("IO context released.");
+            }
+
+            avformat_close_input(&decoder->avformatContext);
+            decoder->avformatContext = NULL;
+            simpleLog("Input closed.");
+
+            releaseDecoderStream(&decoder->videoStream);
+            releaseDecoderStream(&decoder->audioStream);
+            if (decoder->customIoBuffer != NULL) {
+                av_freep(&decoder->customIoBuffer);
+            }
         }
 
-        avformat_close_input(&decoder->avformatContext);
-        decoder->avformatContext = NULL;
-        simpleLog("Input closed.");
-
-        if (decoder->yuvBuffer != NULL) {
-            av_freep(&decoder->yuvBuffer);
-        }
-
-        if (decoder->pcmBuffer != NULL) {
-            av_freep(&decoder->pcmBuffer);
-        }
-        
         if (decoder->avFrame != NULL) {
             av_freep(&decoder->avFrame);
         }
@@ -888,7 +1540,7 @@ ErrorCode closeDecoder() {
     return ret;
 }
 
-int sendData(unsigned char *buff, int size) {
+int sendData(int track, unsigned char *buff, int size) {
     int ret = 0;
     int64_t leftBytes = 0;
     int canWriteBytes = 0;
@@ -903,65 +1555,133 @@ int sendData(unsigned char *buff, int size) {
             break;
         }
 
-        ret = decoder->isStream ? writeToFifo(buff, size) : writeToFile(buff, size);
+        if (decoder->multiStream) {
+            DecoderStream *stream = track == TRACK_TYPE_AUDIO ? &decoder->audioStream : &decoder->videoStream;
+            ret = streamWrite(stream, buff, size);
+        } else {
+            ret = decoder->isStream ? writeToFifo(buff, size) : writeToFile(buff, size);
+        }
     } while (0);
     return ret;
 }
 
 ErrorCode decodeOnePacket() {
-    ErrorCode ret	= kErrorCode_Success;
-    int decodedLen	= 0;
-    int r			= 0;
+    if (decoder == NULL) {
+        return kErrorCode_Invalid_State;
+    }
 
+    if (decoder->multiStream) {
+        DecoderStream *stream = selectNextStreamForDecode();
+        if (stream == NULL) {
+            return kErrorCode_Eof;
+        }
+
+        ErrorCode ret = decodeStreamPacket(stream);
+        if (ret == kErrorCode_Eof) {
+            if (!decoder->videoStream.reachedEof || !decoder->audioStream.reachedEof) {
+                ret = kErrorCode_Success;
+            }
+        }
+        return ret;
+    }
+
+    if (decoder->avformatContext == NULL) {
+        return kErrorCode_Invalid_State;
+    }
+
+    if (getAailableDataSize() <= 0) {
+        return kErrorCode_Invalid_State;
+    }
+
+    ErrorCode ret = kErrorCode_Success;
+    int decodedLen = 0;
+    int r = 0;
     AVPacket packet;
     av_init_packet(&packet);
+    packet.data = NULL;
+    packet.size = 0;
+
+    r = av_read_frame(decoder->avformatContext, &packet);
+    if (r == AVERROR_EOF) {
+        ret = kErrorCode_Eof;
+        goto end;
+    }
+
+    if (r < 0 || packet.size == 0) {
+        ret = kErrorCode_FFmpeg_Error;
+        goto end;
+    }
+
+    DecoderStream *targetStream = NULL;
+    if (packet.stream_index == decoder->videoStream.streamIdx) {
+        targetStream = &decoder->videoStream;
+    } else if (packet.stream_index == decoder->audioStream.streamIdx) {
+        targetStream = &decoder->audioStream;
+    } else {
+        goto end;
+    }
+
     do {
-        if (decoder == NULL) {
-            ret = kErrorCode_Invalid_State;
+        ret = decodePacket(targetStream, &packet, &decodedLen);
+        if (ret != kErrorCode_Success) {
             break;
         }
 
-        if (getAailableDataSize() <= 0) {
-            ret = kErrorCode_Invalid_State;
+        if (decodedLen <= 0) {
             break;
         }
 
-        packet.data = NULL;
-        packet.size = 0;
+        packet.data += decodedLen;
+        packet.size -= decodedLen;
+    } while (packet.size > 0);
 
-        r = av_read_frame(decoder->avformatContext, &packet);
-        if (r == AVERROR_EOF) {
-            ret = kErrorCode_Eof;
-            break;
-        }
-
-        if (r < 0 || packet.size == 0) {
-            break;
-        }
-
-        do {
-            ret = decodePacket(&packet, &decodedLen);
-            if (ret != kErrorCode_Success) {
-                break;
-            }
-
-            if (decodedLen <= 0) {
-                break;
-            }
-
-            packet.data += decodedLen;
-            packet.size -= decodedLen;
-        } while (packet.size > 0);
-    } while (0);
+end:
     av_packet_unref(&packet);
     return ret;
 }
 
 ErrorCode seekTo(int ms, int accurateSeek) {
-    int ret = 0;
     int64_t pts = (int64_t)ms * 1000;
     decoder->accurateSeek = accurateSeek;
-    ret = avformat_seek_file(decoder->avformatContext,
+    decoder->beginTimeOffset = (double)ms / 1000;
+
+    if (decoder == NULL) {
+        return kErrorCode_Invalid_State;
+    }
+
+    if (decoder->multiStream) {
+        int retVideo = avformat_seek_file(decoder->videoStream.formatContext,
+                                          -1,
+                                          INT64_MIN,
+                                          pts,
+                                          pts,
+                                          AVSEEK_FLAG_BACKWARD);
+        int retAudio = avformat_seek_file(decoder->audioStream.formatContext,
+                                          -1,
+                                          INT64_MIN,
+                                          pts,
+                                          pts,
+                                          AVSEEK_FLAG_BACKWARD);
+        if (retVideo < 0 || retAudio < 0) {
+            return kErrorCode_FFmpeg_Error;
+        }
+
+        if (decoder->videoStream.codecContext != NULL) {
+            avcodec_flush_buffers(decoder->videoStream.codecContext);
+        }
+
+        if (decoder->audioStream.codecContext != NULL) {
+            avcodec_flush_buffers(decoder->audioStream.codecContext);
+        }
+
+        decoder->videoStream.reachedEof = 0;
+        decoder->audioStream.reachedEof = 0;
+        decoder->videoStream.hasDecodedFrame = 0;
+        decoder->audioStream.hasDecodedFrame = 0;
+        return kErrorCode_Success;
+    }
+
+    int ret = avformat_seek_file(decoder->avformatContext,
                                  -1,
                                  INT64_MIN,
                                  pts,
@@ -971,15 +1691,18 @@ ErrorCode seekTo(int ms, int accurateSeek) {
     if (ret == -1) {
         return kErrorCode_FFmpeg_Error;
     } else {
-        avcodec_flush_buffers(decoder->videoCodecContext);
-        avcodec_flush_buffers(decoder->audioCodecContext);
+        if (decoder->videoStream.codecContext != NULL) {
+            avcodec_flush_buffers(decoder->videoStream.codecContext);
+        }
+
+        if (decoder->audioStream.codecContext != NULL) {
+            avcodec_flush_buffers(decoder->audioStream.codecContext);
+        }
 
         // Trigger seek callback
         AVPacket packet;
         av_init_packet(&packet);
         av_read_frame(decoder->avformatContext, &packet);
-
-        decoder->beginTimeOffset = (double)ms / 1000;
         return kErrorCode_Success;
     }
 }

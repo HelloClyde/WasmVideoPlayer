@@ -69,8 +69,14 @@ function Player() {
     this.streamReceivedLen  = 0;
     this.firstAudioFrame    = true;
     this.fetchController    = null;
+    this.fetchControllers   = {};
     this.streamPauseParam   = null;
     this.logger             = new Logger("Player");
+    this.useSeparateStreams = false;
+    this.separateSources    = null;
+    this.separateStreamReceived = null;
+    this.separateChunkSize  = null;
+    this.streamChunkSize    = 65536;
     this.initDownloadWorker();
     this.initDecodeWorker();
 }
@@ -113,7 +119,7 @@ Player.prototype.initDecodeWorker = function () {
                 self.onDecodeFinished(objData);
                 break;
             case kRequestDataEvt:
-                self.onRequestData(objData.o, objData.a);
+                self.onRequestData(objData.k, objData.o, objData.a);
                 break;
             case kSeekToRsp:
                 self.onSeekToRsp(objData.r);
@@ -130,8 +136,13 @@ Player.prototype.play = function (url, canvas, callback, waitHeaderLength, isStr
         m: "Success"
     };
 
+    if (typeof url === 'object' && url !== null) {
+        return this.playSeparateStreams(url, canvas, callback, waitHeaderLength);
+    }
+
     var success = true;
     do {
+        this.useSeparateStreams = false;
         if (this.playerState == playerStatePausing) {
             ret = this.resume();
             break;
@@ -232,6 +243,87 @@ Player.prototype.play = function (url, canvas, callback, waitHeaderLength, isStr
     return ret;
 };
 
+Player.prototype.playSeparateStreams = function (sources, canvas, callback, waitHeaderLength) {
+    var ret = {
+        e: 0,
+        m: "Success"
+    };
+
+    do {
+        if (!sources || !sources.video || !sources.audio) {
+            ret = {
+                e: -1,
+                m: "Invalid media sources"
+            };
+            break;
+        }
+
+        if (!canvas) {
+            ret = {
+                e: -2,
+                m: "Canvas not set"
+            };
+            break;
+        }
+
+        if (!this.decodeWorker) {
+            ret = {
+                e: -4,
+                m: "Decoder not initialized"
+            };
+            break;
+        }
+
+        this.useSeparateStreams = true;
+        this.separateSources = sources;
+        this.separateStreamReceived = { video: 0, audio: 0 };
+        this.separateChunkSize = {
+            video: this.streamChunkSize,
+            audio: this.streamChunkSize
+        };
+        this.playerState = playerStatePlaying;
+        this.decoderState = decoderStateIdle;
+        this.isStream = true;
+        this.canvas = canvas;
+        this.callback = callback;
+        this.waitHeaderLength = waitHeaderLength || this.waitHeaderLength;
+        this.frameBuffer = [];
+        this.bufferFrame = [];
+        this.streamReceivedLen = 0;
+        this.firstAudioFrame = true;
+        this.startTrackTimer();
+        this.displayLoop();
+
+        this.webglPlayer = new WebGLPlayer(this.canvas, {
+            preserveDrawingBuffer: false
+        });
+
+        var initReq = {
+            t: kInitDecoderReq,
+            s: { v: -1, a: -1 },
+            c: { v: this.streamChunkSize, a: this.streamChunkSize }
+        };
+        this.decodeWorker.postMessage(initReq);
+
+        this.requestStream(sources.video, kTrackVideo);
+        this.requestStream(sources.audio, kTrackAudio);
+
+        var self = this;
+        this.registerVisibilityEvent(function(visible) {
+            if (visible) {
+                self.resume();
+            } else {
+                self.pause();
+            }
+        });
+
+        this.buffering = true;
+        this.showLoading();
+    } while (false);
+
+    return ret;
+};
+
 Player.prototype.pauseStream = function () {
     if (this.playerState != playerStatePlaying) {
         var ret = {
@@ -241,11 +333,21 @@ Player.prototype.pauseStream = function () {
         return ret;
     }
 
-    this.streamPauseParam = {
-        url: this.fileInfo.url,
-        canvas: this.canvas,
-        callback: this.callback,
-        waitHeaderLength: this.waitHeaderLength
+    if (this.useSeparateStreams) {
+        this.streamPauseParam = {
+            separate: true,
+            sources: this.separateSources,
+            canvas: this.canvas,
+            callback: this.callback,
+            waitHeaderLength: this.waitHeaderLength
+        };
+    } else {
+        this.streamPauseParam = {
+            url: this.fileInfo.url,
+            canvas: this.canvas,
+            callback: this.callback,
+            waitHeaderLength: this.waitHeaderLength
+        };
     }
 
     this.logger.logInfo("Stop in stream pause.");
@@ -307,11 +409,18 @@ Player.prototype.resumeStream = function () {
     }
 
     this.logger.logInfo("Play in stream resume.");
-    this.play(this.streamPauseParam.url,
-              this.streamPauseParam.canvas,
-              this.streamPauseParam.callback,
-              this.streamPauseParam.waitHeaderLength,
-              true);
+    if (this.streamPauseParam.separate) {
+        this.playSeparateStreams(this.streamPauseParam.sources,
+                                  this.streamPauseParam.canvas,
+                                  this.streamPauseParam.callback,
+                                  this.streamPauseParam.waitHeaderLength);
+    } else {
+        this.play(this.streamPauseParam.url,
+                  this.streamPauseParam.canvas,
+                  this.streamPauseParam.callback,
+                  this.streamPauseParam.waitHeaderLength,
+                  true);
+    }
     this.streamPauseParam = null;
 
     var ret = {
@@ -382,6 +491,7 @@ Player.prototype.stop = function () {
         this.logger.logInfo("Video renderer timer stopped.");
     }
 
+    this.abortStreams();
     this.stopDownloadTimer();
     this.stopTrackTimer();
     this.hideLoading();
@@ -406,6 +516,10 @@ Player.prototype.stop = function () {
     this.firstAudioFrame    = true;
     this.urgent             = false;
     this.seekReceivedLen    = 0;
+    this.useSeparateStreams = false;
+    this.separateSources    = null;
+    this.separateStreamReceived = null;
+    this.separateChunkSize  = null;
 
     if (this.pcmPlayer) {
         this.pcmPlayer.destroy();
@@ -501,6 +615,10 @@ Player.prototype.setTrack = function (timeTrack, timeLabel) {
 
 Player.prototype.onGetFileInfo = function (info) {
     if (this.playerState == playerStateIdle) {
+        return;
+    }
+
+    if (this.useSeparateStreams) {
         return;
     }
 
@@ -824,7 +942,11 @@ Player.prototype.onSeekToRsp = function (ret) {
     }
 };
 
-Player.prototype.onRequestData = function (offset, available) {
+Player.prototype.onRequestData = function (track, offset, available) {
+    if (this.useSeparateStreams) {
+        return;
+    }
+
     if (this.justSeeked) {
         this.logger.logInfo("Request data " + offset + ", available " + available);
         if (offset == -1) {
@@ -1101,7 +1223,31 @@ Player.prototype.registerVisibilityEvent = function (cb) {
     }
 }
 
-Player.prototype.onStreamDataUnderDecoderIdle = function (length) {
+Player.prototype.onStreamDataUnderDecoderIdle = function (length, track) {
+    if (this.useSeparateStreams) {
+        if (!this.separateStreamReceived) {
+            this.separateStreamReceived = { video: 0, audio: 0 };
+        }
+
+        if (track === kTrackAudio) {
+            this.separateStreamReceived.audio += length;
+        } else {
+            this.separateStreamReceived.video += length;
+        }
+
+        if (this.separateStreamReceived.video >= this.waitHeaderLength &&
+            this.separateStreamReceived.audio >= this.waitHeaderLength &&
+            this.decoderState == decoderStateIdle) {
+            this.logger.logInfo("Opening decoder for separate streams.");
+            this.decoderState = decoderStateInitializing;
+            var req = {
+                t: kOpenDecoderReq
+            };
+            this.decodeWorker.postMessage(req);
+        }
+        return;
+    }
+
     if (this.streamReceivedLen >= this.waitHeaderLength) {
         this.logger.logInfo("Opening decoder.");
         this.decoderState = decoderStateInitializing;
@@ -1114,10 +1260,13 @@ Player.prototype.onStreamDataUnderDecoderIdle = function (length) {
     }
 };
 
-Player.prototype.requestStream = function (url) {
+Player.prototype.requestStream = function (url, track) {
+    var mediaTrack = (typeof track === 'number') ? track : kTrackVideo;
     var self = this;
-    this.fetchController = new AbortController();
-    const signal = this.fetchController.signal;
+    var controller = new AbortController();
+    this.fetchControllers[mediaTrack] = controller;
+    this.fetchController = controller;
+    const signal = controller.signal;
 
     fetch(url, {signal}).then(async function respond(response) {
         const reader = response.body.getReader();
@@ -1133,14 +1282,20 @@ Player.prototype.requestStream = function (url) {
 
             var dataLength = value.byteLength;
             var offset = 0;
-            if (dataLength > self.fileInfo.chunkSize) {
+            var chunkSize = self.fileInfo ? self.fileInfo.chunkSize : self.streamChunkSize;
+            if (self.useSeparateStreams && self.separateChunkSize) {
+                chunkSize = mediaTrack === kTrackAudio ? self.separateChunkSize.audio : self.separateChunkSize.video;
+            }
+
+            if (dataLength > chunkSize) {
                 do {
-                    let len = Math.min(self.fileInfo.chunkSize, dataLength);
+                    let len = Math.min(chunkSize, dataLength);
                     var data = value.buffer.slice(offset, offset + len);
                     dataLength -= len;
                     offset += len;
                     var objData = {
                         t: kFeedDataReq,
+                        r: mediaTrack,
                         d: data
                     };
                     self.decodeWorker.postMessage(objData, [objData.d]);
@@ -1148,17 +1303,42 @@ Player.prototype.requestStream = function (url) {
             } else {
                 var objData = {
                     t: kFeedDataReq,
+                    r: mediaTrack,
                     d: value.buffer
                 };
                 self.decodeWorker.postMessage(objData, [objData.d]);
             }
 
             if (self.decoderState == decoderStateIdle) {
-                self.onStreamDataUnderDecoderIdle(dataLength);
+                self.onStreamDataUnderDecoderIdle(dataLength, mediaTrack);
             }
 
             return reader.read().then(processData);
         });
     }).catch(err => {
     });
+};
+
+Player.prototype.abortStreams = function () {
+    if (this.fetchController) {
+        try {
+            this.fetchController.abort();
+        } catch (e) {}
+        this.fetchController = null;
+    }
+
+    if (this.fetchControllers) {
+        for (var key in this.fetchControllers) {
+            if (!Object.prototype.hasOwnProperty.call(this.fetchControllers, key)) {
+                continue;
+            }
+            var ctrl = this.fetchControllers[key];
+            if (ctrl) {
+                try {
+                    ctrl.abort();
+                } catch (e) {}
+            }
+        }
+        this.fetchControllers = {};
+    }
 };

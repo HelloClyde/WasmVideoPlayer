@@ -7,25 +7,58 @@ self.Module = {
 self.importScripts("common.js");
 self.importScripts("libffmpeg.js");
 
+const kSeparateStreamDisabled = -2;
+
 function Decoder() {
     this.logger             = new Logger("Decoder");
     this.coreLogLevel       = 1;
     this.accurateSeek       = true;
     this.wasmLoaded         = false;
     this.tmpReqQue          = [];
-    this.cacheBuffer        = null;
+    this.cacheBuffer        = {};
+    this.cacheSize          = {};
     this.decodeTimer        = null;
     this.videoCallback      = null;
     this.audioCallback      = null;
     this.requestCallback    = null;
+    this.useSeparateTracks  = false;
 }
 
 Decoder.prototype.initDecoder = function (fileSize, chunkSize) {
-    var ret = Module._initDecoder(fileSize, this.coreLogLevel);
-    this.logger.logInfo("initDecoder return " + ret + ".");
-    if (0 == ret) {
-        this.cacheBuffer = Module._malloc(chunkSize);
+    var videoSize = fileSize;
+    var audioSize = kSeparateStreamDisabled;
+    var videoChunk = chunkSize;
+    var audioChunk = chunkSize;
+
+    if (typeof fileSize === 'object' && fileSize !== null) {
+        videoSize = typeof fileSize.v === 'number' ? fileSize.v : -1;
+        audioSize = typeof fileSize.a === 'number' ? fileSize.a : -1;
+        this.useSeparateTracks = true;
+    } else {
+        this.useSeparateTracks = false;
     }
+
+    if (typeof chunkSize === 'object' && chunkSize !== null) {
+        videoChunk = typeof chunkSize.v === 'number' ? chunkSize.v : chunkSize;
+        audioChunk = typeof chunkSize.a === 'number' ? chunkSize.a : chunkSize;
+    }
+
+    var ret = Module._initDecoder(videoSize, audioSize, this.coreLogLevel);
+    this.logger.logInfo("initDecoder return " + ret + ".");
+
+    if (ret === 0) {
+        this.cacheSize[kTrackVideo] = videoChunk;
+        this.cacheBuffer[kTrackVideo] = Module._malloc(videoChunk);
+
+        if (this.useSeparateTracks) {
+            this.cacheSize[kTrackAudio] = audioChunk;
+            this.cacheBuffer[kTrackAudio] = Module._malloc(audioChunk);
+        } else {
+            this.cacheSize[kTrackAudio] = 0;
+            this.cacheBuffer[kTrackAudio] = null;
+        }
+    }
+
     var objData = {
         t: kInitDecoderRsp,
         e: ret
@@ -36,10 +69,15 @@ Decoder.prototype.initDecoder = function (fileSize, chunkSize) {
 Decoder.prototype.uninitDecoder = function () {
     var ret = Module._uninitDecoder();
     this.logger.logInfo("Uninit ffmpeg decoder return " + ret + ".");
-    if (this.cacheBuffer != null) {
-        Module._free(this.cacheBuffer);
-        this.cacheBuffer = null;
-    }
+    var self = this;
+    Object.keys(this.cacheBuffer).forEach(function (track) {
+        if (self.cacheBuffer[track]) {
+            Module._free(self.cacheBuffer[track]);
+        }
+    });
+    this.cacheBuffer = {};
+    this.cacheSize = {};
+    this.useSeparateTracks = false;
 };
 
 Decoder.prototype.openDecoder = function () {
@@ -136,10 +174,26 @@ Decoder.prototype.decode = function () {
     }
 };
 
-Decoder.prototype.sendData = function (data) {
+Decoder.prototype.sendData = function (track, data) {
+    if (typeof track !== 'number') {
+        track = kTrackVideo;
+    }
+
+    if (!this.cacheBuffer.hasOwnProperty(track) || this.cacheBuffer[track] === null) {
+        this.logger.logError("Cache buffer for track " + track + " not initialized.");
+        return;
+    }
+
     var typedArray = new Uint8Array(data);
-    Module.HEAPU8.set(typedArray, this.cacheBuffer);
-    Module._sendData(this.cacheBuffer, typedArray.length);
+
+    if (this.cacheSize[track] < typedArray.length) {
+        Module._free(this.cacheBuffer[track]);
+        this.cacheBuffer[track] = Module._malloc(typedArray.length);
+        this.cacheSize[track] = typedArray.length;
+    }
+
+    Module.HEAPU8.set(typedArray, this.cacheBuffer[track]);
+    Module._sendData(track, this.cacheBuffer[track], typedArray.length);
 };
 
 Decoder.prototype.seekTo = function (ms) {
@@ -174,7 +228,7 @@ Decoder.prototype.processReq = function (req) {
             this.pauseDecoding();
             break;
         case kFeedDataReq:
-            this.sendData(req.d);
+            this.sendData(req.r, req.d);
             break;
         case kSeekToReq:
             this.seekTo(req.ms);
@@ -216,14 +270,15 @@ Decoder.prototype.onWasmLoaded = function () {
         self.postMessage(objData, [objData.d.buffer]);
     }, 'viid');
 
-    this.requestCallback = Module.addFunction(function (offset, availble) {
+    this.requestCallback = Module.addFunction(function (track, offset, availble) {
         var objData = {
             t: kRequestDataEvt,
+            k: track,
             o: offset,
             a: availble
         };
         self.postMessage(objData);
-    }, 'vii');
+    }, 'viii');
 
     while (this.tmpReqQue.length > 0) {
         var req = this.tmpReqQue.shift();
