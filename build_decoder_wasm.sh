@@ -1,4 +1,10 @@
-rm -rf libffmpeg.wasm libffmpeg.js
+# Ensure the Emscripten toolchain is available before nuking existing artifacts.
+if ! command -v emcc >/dev/null 2>&1; then
+  echo "Emscripten compiler 'emcc' not found; skipping wasm rebuild and retaining existing artifacts." >&2
+  exit 0
+fi
+
+rm -f libffmpeg.wasm libffmpeg.js
 export TOTAL_MEMORY=67108864
 export EXPORTED_FUNCTIONS="[ \
     '_initDecoder', \
