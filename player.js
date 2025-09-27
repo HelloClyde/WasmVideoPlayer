@@ -563,6 +563,8 @@ Player.prototype.seekTo = function(ms) {
 
     // Stop download.
     this.stopDownloadTimer();
+    this.downloadSeqNo++;
+    this.downloading = false;
 
     // Clear frame buffer.
     this.frameBuffer.length = 0;
@@ -581,6 +583,29 @@ Player.prototype.seekTo = function(ms) {
     this.justSeeked = true;
     this.urgent = true;
     this.seekReceivedLen = 0;
+
+    if (this.fileInfo && this.fileInfo.size > 0 && this.duration > 0) {
+        var ratio = ms / this.duration;
+        if (ratio < 0) {
+            ratio = 0;
+        } else if (ratio > 1) {
+            ratio = 1;
+        }
+
+        var targetOffset = Math.floor(this.fileInfo.size * ratio);
+        if (targetOffset >= this.fileInfo.size) {
+            targetOffset = this.fileInfo.size - 1;
+        }
+
+        if (targetOffset < 0) {
+            targetOffset = 0;
+        }
+
+        this.logger.logInfo("Seek byte offset " + targetOffset + ".");
+        this.fileInfo.offset = targetOffset;
+        this.downloadOneChunk();
+    }
+
     this.startBuffering();
 };
 
