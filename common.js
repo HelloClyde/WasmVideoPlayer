@@ -78,3 +78,9 @@ Logger.prototype.currentTimeStr = function () {
     return year + "-" + month + "-" + day + " " + hour + ":" + min + ":" + sec + ":" + ms;
 }
 
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        Logger: Logger,
+    };
+}
+
